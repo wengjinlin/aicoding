@@ -1,0 +1,104 @@
+# REVIEW.md
+
+> 代码审查清单。`/quick-review` 和 `/full-review` 会参考此文件。
+> 本模板由 init-harness-infra.sh 生成。
+
+## 一、轻量审查（quick-review，3 关）
+
+### 第 1 关：spec-align（规范对齐 + 工程质量）
+
+- [ ] 代码与 `tasks.md` 逐条对齐，无遗漏无多余
+- [ ] Spring 分层：Controller 不直接操作 DAO
+- [ ] Service 继承 `BaseServiceManager`
+- [ ] DTO 规范：单一 DTO，不拆 Param/Query/VO
+- [ ] Controller 层只用 DTO，不用 Entity
+- [ ] Entity 禁用 Lombok，手写 getter/setter
+- [ ] 平台包使用：优先 `sunny-base-*`
+- [ ] 通用质量：无死代码、无 `console.log` / `System.out`、无 TODO、import 干净
+
+### 第 2 关：risk-check（风险检查）
+
+- [ ] SQL 安全：参数化查询、无拼接 SQL、无 `SELECT *`
+- [ ] 空值处理：新字段可空性、前端空值展示、接口返回 null 安全
+- [ ] 索引感知：新增 WHERE 条件是否走索引、避免全表扫描
+- [ ] 隐性约定：已查 `docs/architecture/implicit-contracts.md`
+- [ ] 接口兼容：不破坏已有契约，字段新增而非修改
+- [ ] 数据兼容：DDL 变更对存量数据的处理（默认值、迁移脚本）
+
+### 第 3 关：archive（归档）
+
+- [ ] `openspec/changes/<id>/` 工件完整（proposal/specs/design/tasks）
+- [ ] `tasks.md` 全部 checkbox 打勾
+- [ ] 移入 `openspec/archive/<date>-<id>/`
+- [ ] 更新 `openspec/specs/` 合并新规格
+
+## 二、完整审查（full-review，9 关）
+
+### 第 1 关：`/opsx:verify`（规范对齐）
+
+复用 quick-review 第 1 关。
+
+### 第 2 关：`gstack /review`（通用代码质量）
+
+- [ ] 命名清晰
+- [ ] 函数短小（< 30 行）
+- [ ] 单一职责
+- [ ] 圈复杂度合理（< 10）
+
+### 第 3 关：`/spring-architecture-review`（Spring 分层）
+
+- [ ] 分层调用方向正确
+- [ ] Bean 注入方式统一（推荐构造器注入）
+- [ ] 事务边界正确（@Transactional 范围合理）
+
+### 第 4 关：`/sql-risk-review`（SQL 风险）
+
+- [ ] N+1 问题
+- [ ] 索引使用
+- [ ] 大表 JOIN 顺序
+- [ ] 分页查询性能
+
+### 第 5 关：`gstack /security-review`（安全）
+
+- [ ] 权限校验完整
+- [ ] 敏感数据脱敏
+- [ ] 输入校验（XSS、SQL 注入）
+- [ ] 日志不含敏感信息
+
+### 第 6 关：`gstack /simplify`（简化重构）
+
+- [ ] 删除无用代码
+- [ ] 提取重复逻辑
+- [ ] 简化条件表达式
+
+### 第 7 关：`gstack /qa`（真实测试）
+
+- [ ] 集成测试覆盖主路径
+- [ ] 边界用例
+- [ ] 异常路径
+
+### 第 8 关：`/prepare-review`（PR 摘要）
+
+- [ ] PR 描述清晰
+- [ ] 关联 issue / change-id
+- [ ] 截图（如涉及 UI）
+
+### 第 9 关：`/opsx:archive`（归档）
+
+复用 quick-review 第 3 关。
+
+## 三、审查触发时机
+
+| 时机 | 用哪个 |
+|------|-------|
+| 每个 task 完成 | quick-review（仅自检） |
+| 合并前 | 自动路由（复杂度判断） |
+| 发布前 | full-review |
+| 跨模块重构 | full-review |
+| DDL 变更 | full-review |
+
+## 四、关键约束
+
+- 每关失败必须修完才能进下一关
+- Reviewer 角色严格只读（由 harness-agents 包配置）
+- 审查报告写入 `openspec/changes/<id>/review-reports/`

@@ -1,0 +1,77 @@
+# openspec/config.yaml — 模板
+# 由 init-harness-infra.sh 生成。
+# 首次 AI 会话时，让 Claude 根据项目实际补全字段（项目名、技术栈、模块清单等）。
+
+# 项目元信息
+project:
+  name: ""                    # TODO: 填项目名（如 qms）
+  version: "1.0.0"
+  description: ""
+
+# 技术栈（首次会话由 AI 探测）
+tech_stack:
+  language: ""                # java / kotlin / typescript / python / ...
+  framework: ""               # spring-boot / node / django / ...
+  build_tool: ""              # maven / gradle / npm / ...
+  test_framework: ""          # junit / mockito / jest / ...
+  orm: ""                     # mybatis / jpa / typeorm / ...
+
+# 模型路由（按任务复杂度自动选择 Claude 模型）
+model_routing:
+  explore: haiku              # 需求澄清、快速搜索
+  propose: opus               # proposal/specs 生成、深度业务分析
+  specs: opus                 # 规格细化
+  design: opus                # 技术方案
+  tasks: sonnet               # 任务拆解
+  apply: sonnet               # 编码实施
+  review_simple: sonnet       # quick-review 第 2 关
+  review_complex: opus        # full-review 深度审查
+  archive: haiku              # 归档收尾
+
+# TDD 强约束（每个 task 必须含 5 步）
+tdd:
+  enforce: true
+  steps:
+    - write_failing_test
+    - confirm_test_fails
+    - write_minimal_implementation
+    - confirm_test_passes
+    - commit
+
+# HyperSpec 编排
+hyperspec:
+  enabled: true
+  checkpoints:
+    - profiler-done
+    - requirements-confirmed
+    - openspec-generated
+    - plan-generated
+    - plan-generated-and-confirmed
+    - task-N-complete          # 模板，N 替换为实际 task 编号
+    - verified
+    - reviewed
+    - apply-done
+    - consistency-verified
+    - archived
+    - done
+  resume_from_state: true     # 断点恢复
+  state_file: .hyperspec-state.yaml
+
+# 审查路由（按复杂度自动选 quick 或 full）
+review:
+  auto_route: true
+  quick_threshold:
+    max_tasks: 3
+    max_modules: 1
+    allow_ddl: false
+    allow_cross_service: false
+
+# 项目类型（影响领域技能激活）
+project_type: spring-boot     # spring-boot / node / python / other
+
+# 模块清单（首次会话由 AI 探测，写入实际模块名）
+modules: []
+  # - user
+  # - order
+  # - inventory
+  # - finance

@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Harness V2 角色工具权限矩阵",
+  "description": "由 apply-role.sh 在角色切换时读取，应用到 Claude Code 会话的 permission 配置。Reviewer 严格只读是关键设计。",
+  "version": "1.0",
+  "roles": {
+    "pm": {
+      "description": "产品经理 — 业务需求分析，不写代码",
+      "model": "opus",
+      "permissions": {
+        "allow": [
+          "Read(**)",
+          "Grep(**)",
+          "Glob(**)",
+          "WebFetch(**)"
+        ],
+        "deny": [
+          "Edit(**)",
+          "Write(**)",
+          "Bash(**)",
+          "NotebookEdit(**)"
+        ]
+      },
+      "skills_active": [
+        "requirements-analysis",
+        "business-domain",
+        "stakeholder-interview"
+      ]
+    },
+    "architect": {
+      "description": "架构师 — 技术方案设计，不写业务代码",
+      "model": "opus",
+      "permissions": {
+        "allow": [
+          "Read(**)",
+          "Grep(**)",
+          "Glob(**)",
+          "mcp__omc__lsp_hover",
+          "mcp__omc__lsp_goto_definition",
+          "mcp__omc__lsp_find_references",
+          "mcp__omc__ast_grep_search"
+        ],
+        "deny": [
+          "Edit(**)",
+          "Write(**)",
+          "Bash(**)",
+          "NotebookEdit(**)"
+        ]
+      },
+      "skills_active": [
+        "springboot-patterns",
+        "jpa-patterns",
+        "api-design",
+        "ddd",
+        "architecture-patterns"
+      ]
+    },
+    "tech-lead": {
+      "description": "技术负责人 — 任务拆解、依赖分析",
+      "model": "sonnet",
+      "permissions": {
+        "allow": [
+          "Read(**)",
+          "Grep(**)",
+          "Glob(**)",
+          "mcp__omc__lsp_hover",
+          "mcp__omc__lsp_find_references"
+        ],
+        "deny": [
+          "Edit(**)",
+          "Write(**)",
+          "Bash(**)",
+          "NotebookEdit(**)"
+        ]
+      },
+      "skills_active": [
+        "task-decomposition",
+        "dependency-graph",
+        "estimation",
+        "risk-analysis"
+      ]
+    },
+    "developer": {
+      "description": "开发 — TDD 编码，受 guard_write 保护",
+      "model": "sonnet",
+      "model_override_for_complex": "opus",
+      "permissions": {
+        "allow": [
+          "Read(**)",
+          "Grep(**)",
+          "Glob(**)",
+          "Edit(src/**)",
+          "Edit(test/**)",
+          "Write(src/**)",
+          "Write(test/**)",
+          "Write(superpowers/plans/**)",
+          "Bash(mvn test*)",
+          "Bash(mvn compile*)",
+          "Bash(git add*)",
+          "Bash(git commit*)",
+          "Bash(git status*)",
+          "Bash(git diff*)",
+          "mcp__omc__lsp_*",
+          "mcp__omc__ast_grep_*"
+        ],
+        "deny": [
+          "Write(application*.yml)",
+          "Write(db/**)",
+          "Write(sql/**)",
+          "Bash(git push*)",
+          "Bash(git reset --hard*)",
+          "Bash(mvn deploy*)"
+        ]
+      },
+      "skills_active": [
+        "test-driven-development",
+        "verification-before-completion",
+        "springboot-patterns",
+        "springboot-tdd",
+        "jpa-patterns"
+      ]
+    },
+    "reviewer": {
+      "description": "代码审查员 — 严格只读，独立审查视角",
+      "model": "opus",
+      "permissions": {
+        "allow": [
+          "Read(**)",
+          "Grep(**)",
+          "Glob(**)",
+          "mcp__omc__lsp_hover",
+          "mcp__omc__lsp_goto_definition",
+          "mcp__omc__lsp_find_references",
+          "mcp__omc__lsp_diagnostics",
+          "mcp__omc__ast_grep_search"
+        ],
+        "deny": [
+          "Edit(**)",
+          "Write(**)",
+          "Bash(**)",
+          "NotebookEdit(**)"
+        ]
+      },
+      "skills_active": [
+        "code-review",
+        "security-review",
+        "simplify",
+        "spec-compliance"
+      ],
+      "_note": "Reviewer 用 opus 与 Developer(sonnet) 不同模型，避免共谋"
+    },
+    "tester": {
+      "description": "测试 — 集成/边界/验收，不改生产代码",
+      "model": "sonnet",
+      "permissions": {
+        "allow": [
+          "Read(**)",
+          "Grep(**)",
+          "Glob(**)",
+          "Write(test/**)",
+          "Write(superpowers/plans/**)",
+          "Bash(mvn test*)",
+          "Bash(mvn verify*)",
+          "Bash(mvn failsafe:*)"
+        ],
+        "deny": [
+          "Edit(src/main/**)",
+          "Write(src/main/**)",
+          "Edit(application*.yml)",
+          "Bash(git push*)"
+        ]
+      },
+      "skills_active": [
+        "integration-test",
+        "boundary-test",
+        "performance-test",
+        "test-design"
+      ]
+    },
+    "devops": {
+      "description": "发布 — 归档/CHANGELOG/git tag",
+      "model": "sonnet",
+      "permissions": {
+        "allow": [
+          "Read(**)",
+          "Grep(**)",
+          "Glob(**)",
+          "Edit(CHANGELOG.md)",
+          "Write(CHANGELOG.md)",
+          "Edit(docs/changelog/**)",
+          "Write(docs/changelog/**)",
+          "Edit(openspec/archive/**)",
+          "Bash(git add*)",
+          "Bash(git commit*)",
+          "Bash(git tag*)",
+          "Bash(git log*)"
+        ],
+        "deny": [
+          "Edit(src/**)",
+          "Write(src/**)",
+          "Bash(git push --force*)"
+        ]
+      },
+      "skills_active": [
+        "deployment-patterns",
+        "changelog",
+        "release-management"
+      ]
+    }
+  },
+  "default_role": "developer",
+  "_reviewer_independence_rule": "Reviewer 必须用与 Developer 不同的模型，且工具权限严格只读，避免'自己写自己审'的共谋"
+}

@@ -1,0 +1,57 @@
+# hyperspec-extend.yaml
+# 在 HyperSpec 原有状态之上扩展角色维度
+# apply-role.sh 在每次 checkpoint 切换时合并此文件到 .hyperspec-state.yaml
+
+version: "1.0"
+
+# 当前角色信息（由 apply-role.sh 动态写入）
+# current_role: developer              ← 由 hook 运行时计算
+# role_context:
+#   loaded_skills: [...]               ← 从 permissions.json 取
+#   allowed_tools: [...]               ← 从 permissions.json 取
+#   model: sonnet                      ← 从 permissions.json 取
+#   cleared_context: [...]             ← 角色切换时清空的无关上下文类别
+
+# 上下文隔离规则（每次角色切换时清理）
+context_isolation:
+  pm:
+    load: [business-requirements, historical-proposals]
+    clear: [code-details, technical-implementation]
+  architect:
+    load: [proposal, existing-code-structure, historical-designs]
+    clear: [business-original-narrative]
+  tech-lead:
+    load: [design, module-dependency-graph]
+    clear: [business-background, code-implementation-details]
+  developer:
+    load: [current-task, related-code, tdd-discipline]
+    clear: [business-requirements, other-tasks]
+  reviewer:
+    load: [code-diff, specs-design, security-checklist]
+    clear: [business-background, development-thought-process]
+  tester:
+    load: [test-suite, acceptance-criteria]
+    clear: [implementation-details]
+  devops:
+    load: [all-artifacts, release-history]
+    clear: [business-requirement-details]
+
+# HyperSpec 主循环扩展点
+hooks:
+  pre_checkpoint_advance:
+    - script: .claude/hooks/apply-role.sh
+      description: "checkpoint 推进前加载下一角色"
+  post_checkpoint_advance:
+    - log: .claude/logs/role-switch.log
+      description: "记录角色切换历史"
+
+# 角色切换日志格式
+role_switch_log:
+  path: .claude/logs/role-switch.log
+  format: |
+    [{timestamp}] checkpoint={checkpoint}
+      from={previous_role}
+      to={current_role}
+      model={model}
+      skills_loaded={skills_count}
+      context_cleared={cleared_categories}

@@ -1,0 +1,74 @@
+# AGENTS.md
+
+> 这是项目规范的最高优先级文件。Claude Code 启动时优先读 AGENTS.md > CLAUDE.md > README.md。
+> 本模板由 init-harness-infra.sh 生成，请在首次 AI 会话中让 Claude 根据项目实际补全。
+
+## 一、项目身份
+
+- **项目名称**：<!-- 例如：QMS 质量管理系统 -->
+- **技术栈**：<!-- 例如：Spring Boot 2.7 + JDK 1.8 + MyBatis + Vue 2 -->
+- **业务领域**：<!-- 例如：制造业 MES/QMS -->
+- **当前阶段**：<!-- 例如：长期维护 -->
+
+## 二、编码红线（NEVER）
+
+以下行为**永远禁止**，无论需求多紧急：
+
+- ❌ 修改 `application.yml` / `application-*.yml` / `*.properties`（配置类，由运维改）
+- ❌ 修改 `db/` / `sql/` 下的脚本（生产 DDL/迁移，由 DBA 审核）
+- ❌ 修改 `*.env` / `*credentials*` / `*secrets*` / `*.pem` / `id_rsa*`（密钥类）
+- ❌ 跳过 TDD 直接写实现（新代码必须先写失败测试）
+- ❌ 在没有活跃 `openspec/changes/<id>/` 变更工单时修改代码
+- ❌ 删除已有测试用例（除非该功能已废弃）
+
+## 三、强制规范（DO）
+
+- ✅ 任何代码修改前，先 `/opsx:propose` 生成变更工单
+- ✅ 新代码先写失败测试，再写实现（TDD 红绿重构）
+- ✅ 每完成一个 task 必须跑测试验证
+- ✅ Entity 禁用 Lombok，手写 getter/setter
+- ✅ Controller 只用 DTO，不用 Entity
+- ✅ Service 继承 `BaseServiceManager`
+- ✅ 优先用 `sunny-base-*` 平台包，不引重叠依赖
+- ✅ SQL 参数化查询，禁止字符串拼接
+- ✅ 新增字段必须考虑可空性 + 默认值 + 前端展示
+
+## 四、模块与分层
+
+```
+controller/      ← REST 入口，DTO 转换，不直接操作 DAO
+service/         ← 业务逻辑，继承 BaseServiceManager
+dao/mapper/      ← 数据访问，MyBatis Mapper
+entity/          ← 持久化对象，禁用 Lombok
+dto/             ← 接口契约对象，单一 DTO（不拆 Param/Query/VO）
+config/          ← Spring 配置类
+common/          ← 通用工具、常量、异常
+```
+
+## 五、隐性约定（团队沉淀）
+
+<!-- 这里列出团队"口头约定"的规则。AI 在写代码前会查这里 -->
+<!-- 例如： -->
+<!-- - Result<T> 是统一响应格式 -->
+<!-- - 状态字段命名：xxx_status，值为 0/1/2 -->
+<!-- - 创建时间字段：create_time，类型 LocalDateTime -->
+<!-- - 主键策略：雪花算法，字段名 id，类型 Long -->
+
+详见：`docs/architecture/implicit-contracts.md`
+
+## 六、HyperSpec 全自动流程
+
+简单需求（task ≤ 5、单模块、无 DDL）：
+
+```
+/hyperspec propose "需求描述"
+```
+
+复杂需求：手动走 `/opsx:explore` → `/opsx:propose` → 审查 → `/opsx:apply`。
+
+## 七、Git 规范
+
+- 分支：`feature/<change-id>` / `fix/<bug-id>` / `refactor/<scope>`
+- commit 格式：`<type>(<scope>): <subject>`，type ∈ feat/fix/refactor/test/docs/chore
+- 一个 task 一个 commit（HyperSpec 自动做）
+- 合并前必须 `/quick-review` 或 `/full-review` 通过

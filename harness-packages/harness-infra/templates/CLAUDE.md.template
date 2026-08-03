@@ -1,0 +1,73 @@
+# CLAUDE.md
+
+> Claude Code 协作指令。优先级低于 AGENTS.md，但内容更具体——告诉 Claude 怎么干活。
+> 本模板由 init-harness-infra.sh 生成，请根据团队偏好补全。
+
+## 一、协作风格
+
+- 用中文交流
+- 改动前说一句"我接下来要做 X"
+- 找到 bug 先说"为什么会出现"，再给修复方案
+- 不要悄悄重构无关代码
+- 一次只做一件事，做完再继续
+
+## 二、常用命令
+
+```bash
+# Maven（团队专用路径）
+export JAVA_HOME="/d/jdk1.8.0_171"
+"/c/Program Files/JetBrains/IntelliJ IDEA 2025.3/plugins/maven/lib/maven3/bin/mvn.cmd" -q compile
+
+# 跑单个测试
+".../mvn.cmd" -Dtest=XxxTest test
+
+# Git
+git status
+git diff
+git log --oneline -10
+```
+
+## 三、Harness 命令清单
+
+| 命令 | 何时用 |
+|------|-------|
+| `/opsx:explore` | 需求模糊，需要反问澄清 |
+| `/opsx:propose` | 生成 proposal/specs/design/tasks 4 工件 |
+| `/opsx:apply` | 按 tasks 逐条执行 |
+| `/quick-review` | 小改动 3 关审查（task ≤ 3、单模块） |
+| `/full-review` | 复杂变更 9 关审查 |
+| `/hyperspec` | 一键全自动（propose → apply → archive） |
+| `/superpowers:*` | TDD、systematic-debugging 等纪律 |
+
+## 四、文件保护清单
+
+以下文件不可写（guard_write.py 会拦截）：
+
+- `application.yml` / `application-*.yml`
+- `db/**` / `sql/**`
+- `*.env` / `*credentials*` / `*secrets*`
+- `*.pem` / `id_rsa*`
+
+如需修改，先在 `openspec/changes/` 下创建变更工单并说明理由。
+
+## 五、隐性约定
+
+修改前必读：`docs/architecture/implicit-contracts.md`
+
+如果该文件不存在，让 AI 在会话中根据现有代码推断并生成。
+
+## 六、Context Engineering
+
+- `openspec/specs/` 是规格单一事实来源
+- `superpowers/plans/` 存 TDD 实现计划
+- `docs/architecture/` 存架构约束
+- `docs/standards/` 存编码规范
+- `.claude/instincts/` 跨会话积累的本能知识
+
+## 七、不要做的事
+
+- ❌ 不要假装跑了测试，必须真的执行命令
+- ❌ 不要省略 `verification-before-completion` 步骤
+- ❌ 不要跳过 hooks（--no-verify 等）
+- ❌ 不要在没有 proposal 的情况下改架构性代码
+- ❌ 不要把日志、注释里的中文当 TODO 忽略

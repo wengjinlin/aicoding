@@ -1,0 +1,95 @@
+# checkpoint-map.yaml
+# HyperSpec checkpoint → 主导角色映射表
+# apply-role.sh 在 SessionStart 和每次 checkpoint 切换时读此文件
+
+version: "1.0"
+
+# 默认角色（未匹配到 checkpoint 时）
+default_role: developer
+
+# HyperSpec 12 checkpoint 映射
+checkpoints:
+
+  # === Propose 阶段 ===
+  profiler-done:
+    role: architect
+    reason: 探测项目技术栈，架构师视角更准
+
+  requirements-confirmed:
+    role: pm
+    reason: 业务需求确认由 PM 主导
+
+  # === Apply 阶段 ===
+  openspec-generated:
+    # OpenSpec 生成多个工件，按子工件细 分
+    sub_checkpoints:
+      proposal:
+        role: pm
+        reason: proposal.md 由 PM 主导（业务边界）
+      specs:
+        role: architect
+        reason: specs.md 由 Architect 主导（规格定义）
+      design:
+        role: architect
+        reason: design.md 由 Architect 主导（技术方案）
+      tasks:
+        role: tech-lead
+        reason: tasks.md 由 Tech Lead 主导（拆解）
+
+  plan-generated:
+    role: tech-lead
+    reason: TDD 计划拆解由 Tech Lead 主导
+
+  plan-generated-and-confirmed:
+    role: developer
+    reason: 计划确认后立即进入 Developer
+
+  # task-N 由 HyperSpec 动态展开为 task-1-complete, task-2-complete...
+  task-N-complete:
+    pattern: "^task-\\d+-complete$"
+    role: developer
+    reason: 每个 task 的 TDD 编码
+
+  verified:
+    role: tester
+    reason: 全量测试验证由 Tester 主导
+
+  reviewed:
+    role: reviewer
+    reason: 代码审查由 Reviewer 主导（独立视角）
+
+  apply-done:
+    role: reviewer
+    reason: 实施完成后的最终审查
+
+  consistency-verified:
+    role: reviewer
+    reason: 代码 vs specs 一致性审查
+
+  # === Archive 阶段 ===
+  archived:
+    role: devops
+    reason: 归档/CHANGELOG/git tag 由 DevOps 主导
+
+  done:
+    role: null
+    reason: 流程结束，无角色
+
+# 协作角色（非主导但参与）
+collaborators:
+  proposal-draft: [architect]
+  specs-draft: [pm]
+  design-draft: [tech-lead]
+  task-N-tdd: [tester]
+  integration-test: [developer]
+  final-review: [architect]
+  archive-draft: [pm]
+  archive-apply: []
+
+# 升级触发（角色遇到以下情况时升级到 Coordinator → 人类）
+escalation_triggers:
+  reviewer_reject_task: "Reviewer 打回 → 重做 task"
+  tester_finds_integration_bug: "Tester 发现集成 bug → 退回 Developer"
+  pm_rejects_specs: "PM 拒绝 specs → 重写"
+  architect_finds_infeasible: "Architect 发现 proposal 不可行 → 重新定义边界"
+  role_conflict: "角色之间冲突 → Coordinator 仲裁"
