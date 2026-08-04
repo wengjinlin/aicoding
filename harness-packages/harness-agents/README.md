@@ -58,8 +58,22 @@ HyperSpec 主循环
 | harness-infra 已装 | `ls .claude/skills/hyperspec` | 必须先装基础包 |
 | HyperSpec 可用 | Claude 内 `/hyperspec --help` | 必须正常响应 |
 | 项目可正常 `/hyperspec` | 试跑一个小需求 | 跑通后再装本包 |
+| **jq 可执行** | `jq --version` | **必需**：注入 SessionStart hook 靠 jq 深度合并，无 jq 会报错退出 |
 
 **未装 harness-infra 直接装本包**：脚本会报错退出，不会污染项目。
+
+**jq 缺失**：脚本会在预检阶段 fail-fast 退出，提示安装方式。
+
+### jq 跨平台安装
+
+| 平台 | 命令 |
+|------|------|
+| Windows（winget） | `winget install jqlang.jq --source winget` |
+| Windows（scoop） | `scoop install jq` |
+| Windows（choco） | `choco install jq` |
+| macOS | `brew install jq` |
+| Ubuntu/Debian | `sudo apt-get install -y jq` |
+| Fedora/RHEL | `sudo dnf install -y jq` |
 
 ---
 
@@ -71,14 +85,41 @@ cd your-project
 bash harness-agents/install-harness-agents.sh
 ```
 
-安装脚本会：
+### 4.0 Windows 用户必读
+
+Windows 上**必须用 Git Bash 或 MSYS2 bash**（不能用 PowerShell / cmd），原因：
+- 安装脚本里大量使用 bash 关联数组、`set -uo pipefail`、heredoc 等 POSIX shell 特性
+- jq 在 bash 环境下 path 解析才稳定
+
+| 步骤 | 操作 |
+|------|------|
+| 1. 打开 Git Bash | 开始菜单搜 "Git Bash"；或在资源管理器目标目录右键 → "Git Bash Here" |
+| 2. 切到项目目录 | `cd /e/your-project`（注意是 `/e/` 不是 `E:\`） |
+| 3. 跑安装脚本 | `bash harness-agents/install-harness-agents.sh` |
+
+Windows 路径在 bash 中的写法对照：
+
+| Windows 路径 | Bash 路径 |
+|--------------|-----------|
+| `E:\your-project` | `/e/your-project` |
+| `C:\Users\me\code\app` | `/c/Users/me/code/app` |
+
+### 4.1 安装脚本会做的事
+
 1. ✅ 检测 `.claude/skills/hyperspec` 是否存在（验证 infra 已装）
-2. ✅ 备份当前 `.claude/settings.local.json` 到 `.harness-backup-{date}/`
-3. ✅ 创建 `.claude/agents/` 目录并写入 7 个角色 prompt
-4. ✅ 创建 `.claude/team-roles/` 目录并写入权限矩阵 + checkpoint 映射
-5. ✅ 添加 `apply-role.sh` hook 到 `.claude/hooks/`
-6. ✅ 修改 `SessionStart` hook 配置，让 HyperSpec 启动时调用 `apply-role.sh`
-7. ✅ 验证角色加载正确
+2. ✅ **预检 jq 是否可用**（fail-fast，无 jq 直接退出）
+3. ✅ 备份当前 `.claude/settings.local.json` 到 `.harness-backup-{date}/`
+4. ✅ 创建 `.claude/agents/` 目录并写入 7 个角色 prompt
+5. ✅ 创建 `.claude/team-roles/` 目录并写入权限矩阵 + checkpoint 映射
+6. ✅ 添加 `apply-role.sh` + `on-state-change.sh` 到 `.claude/hooks/`
+7. ✅ 用 jq 深度合并 `SessionStart` + `PostToolUse(Write|Edit)` hook 到 `settings.local.json`（保持 `{matcher, hooks: [...]}` 嵌套结构）
+8. ✅ 验证角色加载正确
+
+> **关于 hooks 嵌套结构**：Claude Code 要求 `hooks.<event>` 必须是数组，每项为 `{matcher, hooks: [{type, command}]}`。本脚本生成的 SessionStart 配置形如：
+> ```json
+> {"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"bash .claude/hooks/apply-role.sh"}]}]}}
+> ```
+> 旧的 flat 结构 `{type, command, matcher}` 会被 Claude Code 拒绝（`Settings Error: hooks: Expected array`）。脚本已兼容旧 flat 结构——重跑会自动迁移。
 
 ---
 
@@ -110,7 +151,10 @@ bash harness-agents/install-harness-agents.sh
 
 | 文件 | 触发时机 | 作用 |
 |------|---------|------|
-| `.claude/hooks/apply-role.sh` | SessionStart + 每次 checkpoint 推进 | 读 `.hyperspec-state.yaml` 的 `current_checkpoint` → 查 checkpoint-map → 加载对应角色 |
+| `.claude/hooks/apply-role.sh` | SessionStart + 每次 HyperSpec 改状态文件 | 读 `.hyperspec-state.yaml` 的 `checkpoint` → 查 checkpoint-map → 加载对应角色 |
+| `.claude/hooks/on-state-change.sh` | PostToolUse(Write\|Edit) | basename 过滤 `.hyperspec-state.yaml` 改动 → 调 apply-role.sh |
+
+**为什么需要两个 hook**:Claude Code 没有"checkpoint 推进"粒度的原生事件。HyperSpec skill 推进 checkpoint 时用 Edit 工具改 `.hyperspec-state.yaml`,这会触发 `PostToolUse(Write|Edit)` 事件。`on-state-change.sh` 利用该事件作为 checkpoint 切换信号 — 不依赖 HyperSpec 上游配合,也不依赖 Claude Code 不存在的 PreCheckpointAdvance 事件。
 
 ### 5.4 卸载脚本
 

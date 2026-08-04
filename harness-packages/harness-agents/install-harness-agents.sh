@@ -26,6 +26,8 @@ TEAM_ROLE_CONFIGS=(permissions.json checkpoint-map.yaml hyperspec-extend.yaml)
 
 # 角色切换 hook
 ROLE_HOOK="apply-role.sh"
+# 状态文件变更监听 hook（PostToolUse,触发 apply-role.sh 重新注入角色）
+STATE_CHANGE_HOOK="on-state-change.sh"
 
 MODE="conservative"
 VERBOSE=0
@@ -116,6 +118,25 @@ check_infra_installed() {
 preflight() {
     log_step "预检：扫描角色配置"
 
+    # jq fail-fast：注入 SessionStart hook 必须用 jq 深度合并，否则会产生错误结构
+    if ! has_cmd jq; then
+        cat >&2 <<'EOF'
+
+❌ 未检测到 jq。harness-agents 需要 jq 来深度合并 SessionStart hook 到 settings.local.json。
+   Claude Code hooks 必须为嵌套结构 {matcher, hooks: [...]}，没有 jq 无法保证结构正确。
+
+   Windows 安装：
+     winget install jqlang.jq --source winget
+     或：scoop install jq
+     或：choco install jq
+
+   macOS：brew install jq
+   Linux：apt/dnf/yum install jq
+
+EOF
+        exit 1
+    fi
+
     # 7 个角色 prompt
     for role in "${ROLE_AGENTS[@]}"; do
         local target=".claude/agents/${role}.md"
@@ -148,7 +169,15 @@ preflight() {
         DECISIONS["hook:${ROLE_HOOK}"]="INSTALL"
     fi
 
-    # settings.local.json 注入 SessionStart hook
+    # on-state-change.sh hook（标准件，每次覆盖）
+    local state_hook_target=".claude/hooks/${STATE_CHANGE_HOOK}"
+    if [[ -f "$state_hook_target" ]]; then
+        DECISIONS["hook:${STATE_CHANGE_HOOK}"]="BACKUP_OVERWRITE"
+    else
+        DECISIONS["hook:${STATE_CHANGE_HOOK}"]="INSTALL"
+    fi
+
+    # settings.local.json 注入 SessionStart + PostToolUse hook
     if [[ -f ".claude/settings.local.json" ]]; then
         DECISIONS["settings.local.json"]="MERGE"
     else
@@ -190,8 +219,15 @@ print_preflight_report() {
         BACKUP_OVERWRITE) echo "🔄 hooks/${ROLE_HOOK} 将覆盖（备份后）"; ((will_backup++)) ;;
     esac
 
+    # on-state-change.sh hook
+    local action2="${DECISIONS[hook:${STATE_CHANGE_HOOK}]}"
+    case "$action2" in
+        INSTALL)          echo "🆕 hooks/${STATE_CHANGE_HOOK} 将安装";       ((will_do++)) ;;
+        BACKUP_OVERWRITE) echo "🔄 hooks/${STATE_CHANGE_HOOK} 将覆盖（备份后）"; ((will_backup++)) ;;
+    esac
+
     # settings.local.json
-    echo "🔀 .claude/settings.local.json 将追加 SessionStart hook（深度合并）"; ((will_do++))
+    echo "🔀 .claude/settings.local.json 将追加 SessionStart + PostToolUse hook（深度合并）"; ((will_do++))
 
     echo "────────────────────────────────────────────────────────────"
     echo "将执行 $will_do 项，跳过 $will_skip 项，备份覆盖 $will_backup 项。"
@@ -302,42 +338,86 @@ install_role_hook() {
 }
 
 # =============================================================================
-# 修改 settings.local.json：注入 SessionStart hook
+# 安装 on-state-change.sh hook
 # =============================================================================
-inject_session_start_hook() {
-    log_step "注入 SessionStart hook（深度合并 settings.local.json）"
+install_state_change_hook() {
+    log_step "安装 on-state-change.sh hook（PostToolUse 监听状态文件改动）"
+    local src="${SCRIPT_DIR}/hooks/${STATE_CHANGE_HOOK}"
+    local dst="${PROJECT_ROOT}/.claude/hooks/${STATE_CHANGE_HOOK}"
+
+    if [[ ! -f "$src" ]]; then
+        die "源 hook 缺失：$src"
+    fi
+
+    if [[ -f "$dst" ]]; then
+        [[ -n "$BACKUP_DIR" ]] && backup_file "$dst"
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+    cp -p "$src" "$dst"
+    chmod +x "$dst" 2>/dev/null || true
+    log_info "${STATE_CHANGE_HOOK}：已安装"
+}
+
+# =============================================================================
+# 修改 settings.local.json：注入 SessionStart + PostToolUse hook
+# =============================================================================
+inject_hooks() {
+    log_step "注入 SessionStart + PostToolUse hook（深度合并 settings.local.json）"
     local dst=".claude/settings.local.json"
 
     [[ ! -f "$dst" ]] && die "$dst 不存在"
 
     if ! has_cmd jq; then
-        log_warn "jq 不可用，无法自动注入。请手动在 $dst 添加 SessionStart hook 调用 apply-role.sh"
+        log_warn "jq 不可用，无法自动注入。请手动在 $dst 添加 hook 配置"
         return
     fi
 
     if [[ "$MODE" == "dryrun" ]]; then
-        echo "  [dryrun] 将向 $dst 追加 SessionStart hook 配置"
+        echo "  [dryrun] 将向 $dst 注入 SessionStart 与 PostToolUse hook 配置"
         return
     fi
 
     [[ -n "$BACKUP_DIR" ]] && backup_file "$dst"
 
     local tmp="${dst}.tmp.$$"
-    # 在 hooks.SessionStart 数组中追加 apply-role.sh（若已存在则不重复）
+    # Claude Code hooks schema: 必须为 {matcher, hooks: [...]} 嵌套结构
+    # 兼容两种旧格式：flat {type,command} 与 嵌套 {matcher, hooks:[...]}
+    # 幂等：已存在的命令不会重复添加
+    # SessionStart: matcher="" — 会话启动时拉一次初始角色
+    # PostToolUse: matcher="Write|Edit" — HyperSpec 用 Edit 改 .hyperspec-state.yaml 时
+    #             由 on-state-change.sh 内部过滤 basename 后触发 apply-role.sh
     jq '
       .hooks = (.hooks // {})
-      | .hooks.SessionStart = ((.hooks.SessionStart // []) + [{
-          "type": "command",
-          "command": "bash .claude/hooks/apply-role.sh"
-        }])
-      | .hooks.SessionStart |= unique_by(.command)
+      | .hooks.SessionStart = [
+          {
+            "matcher": "",
+            "hooks": (
+              [(.hooks.SessionStart // [])[] | if .hooks then .hooks[] else . end]
+              | map(select(.command != "bash .claude/hooks/apply-role.sh"))
+              + [{"type": "command", "command": "bash .claude/hooks/apply-role.sh"}]
+            )
+          }
+        ]
+      | .hooks.PostToolUse = [
+          {
+            "matcher": "Write|Edit",
+            "hooks": (
+              [(.hooks.PostToolUse // [])[]
+               | select(.matcher == "Write|Edit" or .matcher == "Edit|Write" or .matcher == "Write" or .matcher == "Edit")
+               | if .hooks then .hooks[] else . end]
+              | map(select(.command != "bash .claude/hooks/on-state-change.sh"))
+              + [{"type": "command", "command": "bash .claude/hooks/on-state-change.sh"}]
+            )
+          }
+        ]
     ' "$dst" > "$tmp" && mv "$tmp" "$dst" || {
         rm -f "$tmp"
         log_warn "jq 注入失败，请手动添加"
         return
     }
 
-    log_info "SessionStart hook 已注入（幂等，重跑不会重复）"
+    log_info "SessionStart + PostToolUse hook 已注入（幂等，重跑不会重复）"
 }
 
 # =============================================================================
@@ -363,6 +443,28 @@ print_summary() {
     [[ -n "$BACKUP_DIR" ]] && echo "📦 本次备份：${BACKUP_DIR#$PROJECT_ROOT/}"
     [[ "$MODE" == "dryrun" ]] && echo "🧪 dry-run 未写文件，去掉 --dry-run 重新执行以安装。"
     echo "📝 详细日志：${LOG_FILE#$PROJECT_ROOT/}"
+
+    cat <<'EOF'
+
+============================================================
+让 AI 补全项目文档（复制以下内容到 Claude Code 会话执行）
+============================================================
+
+我刚通过 harness-agents 安装了 Agent 角色分工包。请：
+
+1. 阅读 .claude/agents/ 下的 7 个角色 prompt（pm/architect/tech-lead/developer/reviewer/tester/devops）
+2. 阅读 .claude/team-roles/permissions.json 与 checkpoint-map.yaml
+3. 在仓库根目录创建 AGENTS.md（如不存在），按如下结构补全：
+   - 项目概览（一段话说明项目目标）
+   - 技术栈与关键依赖
+   - 目录结构与职责划分
+   - 开发工作流（含 HyperSpec 角色切换机制）
+   - 角色权限矩阵摘要（参考 .claude/team-roles/permissions.json）
+4. 检查 SessionStart hook 是否在 .claude/settings.local.json 中正确配置（应为 {matcher:"",hooks:[{type:"command",command:"bash .claude/hooks/apply-role.sh"}]} 嵌套结构）
+5. 跑一次 /hyperspec "测试需求"，验证角色切换日志 .claude/logs/role-switch.log 是否生成
+
+============================================================
+EOF
 }
 
 main() {
@@ -382,7 +484,8 @@ main() {
     install_role_agents
     install_team_role_configs
     install_role_hook
-    inject_session_start_hook
+    install_state_change_hook
+    inject_hooks
 
     write_log "==== 完成 ===="
     print_summary

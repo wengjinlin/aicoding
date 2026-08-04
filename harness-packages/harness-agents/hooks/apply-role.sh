@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# apply-role.sh — SessionStart / PreCheckpointAdvance Hook
-# 根据 .hyperspec-state.yaml 的 current_checkpoint，加载对应角色配置
+# apply-role.sh — 角色加载器（被 SessionStart + PostToolUse hook 调用）
+# 根据 .hyperspec-state.yaml 的 checkpoint 字段，加载对应角色配置
 #
 # 触发：
-#   1. SessionStart（会话启动）— 由 settings.local.json 中 hooks.SessionStart 调用
-#   2. PreCheckpointAdvance（每次 checkpoint 推进）— 由 HyperSpec 调用
+#   1. SessionStart（会话启动）— 由 settings.local.json 中 hooks.SessionStart 直接调用
+#   2. PostToolUse(Write|Edit)（HyperSpec 改 .hyperspec-state.yaml 时）
+#      — 由 on-state-change.sh 内部 basename 过滤后调用
+#
+# 设计理由：
+#   Claude Code 没有 PreCheckpointAdvance 事件。HyperSpec skill 推进 checkpoint
+#   时用 Edit 工具改 .hyperspec-state.yaml，这会触发 PostToolUse(Write|Edit)
+#   原生事件。on-state-change.sh 利用该事件作为"checkpoint 切换信号"。
 #
 # 行为：
-#   1. 读 .hyperspec-state.yaml 的 current_checkpoint
+#   1. 读 .hyperspec-state.yaml 的 checkpoint（兼容旧字段 current_checkpoint）
 #   2. 查 .claude/team-roles/checkpoint-map.yaml 得到 current_role
 #   3. 读 .claude/team-roles/permissions.json 得到该角色的权限/技能/模型
 #   4. 读 .claude/agents/{role}.md 作为 system prompt override
@@ -46,6 +52,9 @@ elif command -v python3 >/dev/null 2>&1 && python3 -c "import yaml" 2>/dev/null;
 else
     # 无 YAML 解析器，做最简单的 grep 提取（兜底）
     YAML_TOOL="grep"
+    echo "[apply-role] WARN: yq 与 python3-yaml 均不可用，走 grep/awk 兜底。" >> "$LOG_FILE"
+    echo "[apply-role]        建议装 yq（winget install MikeFarah.yq）或 pip install pyyaml，" >> "$LOG_FILE"
+    echo "[apply-role]        否则 task-N-complete 等 pattern 匹配可能失效。" >> "$LOG_FILE"
 fi
 
 read_yaml_field() {
@@ -56,20 +65,36 @@ read_yaml_field() {
             yq -r "$path" "$file" 2>/dev/null
             ;;
         python-yaml)
-            python3 -c "
-import yaml, sys
-with open('$file') as f:
+            # 注意1：Windows 上 python3 多为 pyenv-win shim (.bat 文件)，
+            #         多行 `python3 -c "..."` 会被 batch 解析器破坏。
+            # 注意2：Windows Python 不认 MSYS 风格路径 (/e/foo/bar)，
+            #         必须用 cygpath -m 转成 C:/foo/bar 形式。
+            # 解决：写 .py 文件 + 路径转换。
+            local py_file="$file"
+            if command -v cygpath >/dev/null 2>&1; then
+                py_file=$(cygpath -m "$file" 2>/dev/null || echo "$file")
+            fi
+            local tmp_py="${TMPDIR:-/tmp}/harness-yaml-$$.py"
+            cat > "$tmp_py" <<PY
+import yaml
+with open('$py_file', encoding='utf-8') as f:
     data = yaml.safe_load(f)
-cursor = data
-for part in '$path'.split('.'):
-    if part.startswith('[') and part.endswith(']'):
-        cursor = cursor[int(part[1:-1])]
-    elif cursor is None:
-        break
+path = '$path'.lstrip('.')
+parts = []
+for chunk in path.split('.'):
+    if len(chunk) >= 2 and chunk[0] == '"' and chunk[-1] == '"':
+        parts.append(chunk[1:-1])
     else:
-        cursor = cursor.get(part) if isinstance(cursor, dict) else None
+        parts.append(chunk)
+cursor = data
+for part in parts:
+    if cursor is None:
+        break
+    cursor = cursor.get(part) if isinstance(cursor, dict) else None
 print('' if cursor is None else cursor)
-" 2>/dev/null
+PY
+            python3 "$tmp_py" 2>/dev/null
+            rm -f "$tmp_py"
             ;;
         grep)
             # 最简单的兜底：取顶层 key
@@ -92,8 +117,13 @@ if [[ ! -f "$STATE_FILE" ]]; then
     log "state 文件不存在 — 默认 developer 角色"
     CURRENT_CHECKPOINT=""
 else
-    CURRENT_CHECKPOINT="$(read_yaml_field "$STATE_FILE" '.current_checkpoint')"
-    log "current_checkpoint=${CURRENT_CHECKPOINT:-（空）}"
+    # HyperSpec SKILL.md 标准字段是 checkpoint，旧版本用 current_checkpoint。
+    # 优先读 checkpoint，没有再回退到 current_checkpoint。
+    CURRENT_CHECKPOINT="$(read_yaml_field "$STATE_FILE" '.checkpoint')"
+    if [[ -z "$CURRENT_CHECKPOINT" || "$CURRENT_CHECKPOINT" == "null" ]]; then
+        CURRENT_CHECKPOINT="$(read_yaml_field "$STATE_FILE" '.current_checkpoint')"
+    fi
+    log "checkpoint=${CURRENT_CHECKPOINT:-（空）}"
 fi
 
 # =============================================================================
@@ -103,15 +133,23 @@ CURRENT_ROLE="developer"
 if [[ -n "$CURRENT_CHECKPOINT" && -f "$CHECKPOINT_MAP" ]]; then
     # 尝试精确匹配
     ROLE_FOUND=""
-    # 用 grep 提取 checkpoint 块
-    if [[ "$YAML_TOOL" == "grep" ]]; then
-        # 兜底：用 awk 解析
-        ROLE_FOUND=$(awk -v cp="$CURRENT_CHECKPOINT" '
+    # 通用 awk：解析 checkpoint 块取 role 字段
+    _awk_lookup() {
+        local key="$1"
+        awk -v cp="$key" '
             BEGIN { in_block=0 }
             /^checkpoints:/ { in_checkpoints=1; next }
-            in_checkpoints && /^  [a-zA-Z]/ { current=$1; sub(/:$/,"",current); in_block=(current==cp) ? 1 : 0 }
-            in_block && /^    role:/ { sub(/^.*role:[[:space:]]*/,""); gsub(/"/,""); print; exit }
-        ' "$CHECKPOINT_MAP")
+            in_checkpoints && /^  [a-zA-Z][^:]*:$/ { current=$1; sub(/:$/,"",current); in_block=(current==cp) ? 1 : 0 }
+            in_block && /^    role:/ { sub(/^.*role:[[:space:]]*/,""); gsub(/["'"'"']/,""); print; exit }
+        ' "$CHECKPOINT_MAP"
+    }
+    if [[ "$YAML_TOOL" == "grep" ]]; then
+        # 兜底：awk 精确匹配
+        ROLE_FOUND="$(_awk_lookup "$CURRENT_CHECKPOINT")"
+        # task-N-complete pattern 兜底（与 YAML 分支对齐）
+        if [[ -z "$ROLE_FOUND" && "$CURRENT_CHECKPOINT" =~ ^task-[0-9]+-complete$ ]]; then
+            ROLE_FOUND="$(_awk_lookup "task-N-complete")"
+        fi
     else
         # 正经 YAML 解析
         ROLE_FOUND=$(read_yaml_field "$CHECKPOINT_MAP" ".checkpoints.${CURRENT_CHECKPOINT}.role")
