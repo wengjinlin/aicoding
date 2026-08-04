@@ -51,13 +51,107 @@
 | Maven 可用 | `mvn -v` | 任意版本 |
 | Claude Code CLI | `claude --version` | ≥ 2.0 |
 | Node.js | `node --version` | ≥ 18（用于 npm 安装 skills） |
+| **jq（硬依赖）** | `jq --version` | ≥ 1.6（用于 settings.local.json 深度合并、MCP 注册） |
+| **Python 3（软依赖）** | `python --version` | ≥ 3.8（用于 Hooks：`guard_write.py`、`ensure_change_context.py`） |
 | 项目可编译 | `mvn compile` | BUILD SUCCESS |
 
 任一检查失败，请先解决再装本包。
 
+### jq 与 Python 的安装方式（如缺失）
+
+| 平台 | jq | Python |
+|------|-----|--------|
+| **Windows (Git Bash)** | `winget install jqlang.jq --source winget`<br>或 `scoop install jq`<br>或从 [jqlang/jq releases](https://github.com/jqlang/jq/releases) 下载 `jq-windows-amd64.exe`，重命名 `jq.exe` 放到 PATH（如 `C:\Users\<你>\bin\`） | [python.org](https://www.python.org/downloads/) 下载安装，**勾选 "Add python.exe to PATH"** |
+| **macOS** | `brew install jq` | `brew install python` |
+| **Linux (Debian)** | `sudo apt-get install jq` | `sudo apt-get install python3` |
+| **Linux (RHEL/Fedora)** | `sudo dnf install jq` | `sudo dnf install python3` |
+
+> **注意**：Windows 上 `winget` 可能因 msstore 源证书问题失败，加 `--source winget` 跳过 msstore 即可。装完 jq 后**关闭所有 Git Bash 窗口重开**（让 PATH 生效）。
+
+> **注意**：Linux/Mac 上 Python 命令可能是 `python3` 而非 `python`。脚本生成的 `.claude/settings.local.json` 中 hooks 默认写 `python ...`，Linux/Mac 用户如需修改请编辑该文件。
+
 ---
 
 ## 四、安装方式
+
+### 4.0 Windows 用户必读（首次安装前看）
+
+本脚本依赖 **bash 4+**（关联数组 `declare -A`）和 **jq**，无法在 PowerShell/cmd 中直接运行。Windows 用户请按下表选择 bash 环境：
+
+| 环境 | 推荐度 | 路径写法 | 备注 |
+|------|-------|---------|------|
+| **Git Bash**（Git for Windows 自带） | ⭐⭐⭐ 推荐 | `/e/your-project`（盘符挂载） | 大部分人已经有，PATH 与 Windows 共享 |
+| **WSL / WSL2** | ⭐⭐ | `/mnt/e/your-project` | 完整 Linux 环境，但文件系统跨边界性能略差 |
+| **MSYS2 / Cygwin** | ⭐ | `/e/your-project` | 可用但配置略繁琐 |
+
+**打开 Git Bash 的三种方式**：
+
+1. **开始菜单** → 搜 "Git Bash" → 回车
+2. **文件资源管理器** → 进入项目目录 → **右键空白处** → "**Git Bash Here**"（最方便，自动 cd 到当前目录）
+3. **VS Code** → `Ctrl + ` ` ` 打开终端 → 右上角下拉箭头选 **Git Bash**
+
+**路径写法对照**（最容易踩的坑）：
+
+| Windows 写法 | bash 写法 |
+|------------|----------|
+| `E:\claude\harness-infra\` | `/e/claude/harness-infra/` |
+| `C:\Users\wengjl\` | `/c/Users/wengjl/` |
+| `D:\IdeaProjects\sunny\` | `/d/IdeaProjects/sunny/` |
+
+**完整流程（Git Bash 示例）**：
+
+```bash
+# 1. 在文件资源管理器里进入你的项目根目录 → 右键 → Git Bash Here
+# 2. 确认当前目录
+pwd                          # 应输出 /e/IdeaProjects/your-project
+
+# 2. 把 harness-infra 放到项目根（如果是 submodule 引入则跳过）
+cp -r /e/claude/harness-packages/harness-infra ./harness-infra
+
+# 3. 先预演看会发生什么（不写文件）
+bash harness-infra/init-harness-infra.sh --dry-run
+
+# 4. 正式执行
+bash harness-infra/init-harness-infra.sh
+
+# 5. 验证（**新开 Claude Code 会话**才能识别新装的 skills）
+claude
+> /hyperspec --help
+```
+
+> **不要用 PowerShell/cmd 直接跑**——会因 `declare -A` 关联数组报语法错误。
+>
+> **不要用 `sh xxx.sh`**——同理，必须用 `bash xxx.sh`。
+
+### 4.1 GitHub 网络与代理配置（公司网络用户必读）
+
+本脚本会通过 `npx skills add` 从 GitHub 克隆 4 个仓库（superpowers、gstack、HyperSpec、ecc）。如果你在公司内网，访问 github.com 经常超时（错误信息：`Failed to connect to github.com port 443`），需要配置代理。
+
+**重要**：npm 镜像（如 `npmmirror.com`）**管不到 git clone**——skills 走的是 git/https 协议克隆，与 npm 包下载是两回事。
+
+**给 git 配代理**（在 Git Bash 里执行）：
+
+```bash
+# 临时（仅当前会话）
+export HTTPS_PROXY=http://your-proxy:port
+export HTTP_PROXY=http://your-proxy:port
+
+# 永久（写入 git 全局配置）
+git config --global http.proxy http://your-proxy:port
+git config --global https.proxy http://your-proxy:port
+
+# 验证
+git config --global --get http.proxy
+```
+
+**取消代理**：
+
+```bash
+git config --global --unset http.proxy
+git config --global --unset https.proxy
+```
+
+**如果公司禁用 GitHub**：可以让已经能访问 GitHub 的同事把 `.claude/skills/` 整个目录打个 tar 包给你，解压到项目同名路径即可，无需重装。
 
 ### 方式 1：本地脚本安装（推荐）
 

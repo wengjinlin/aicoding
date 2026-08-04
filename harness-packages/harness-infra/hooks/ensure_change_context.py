@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ensure_change_context.py — PreBash Hook
+# ensure_change_context.py — PreToolUse Hook (matcher: Bash)
 # 阻止在"无活跃变更"状态下执行风险命令（写代码/跑迁移/改 db）
 #
 # 设计理由：

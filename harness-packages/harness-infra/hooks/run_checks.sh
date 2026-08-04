@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# run_checks.sh — PostWrite Hook
+# run_checks.sh — PostToolUse Hook (matcher: Write|Edit)
 # Java 文件保存后自动编译检查（仅当改动 .java 文件时）
 #
-# 触发：Edit / Write 工具调用后，matcher 配置为 \.java$
+# 触发：Edit / Write 工具调用后；脚本内部按 file_path 后缀过滤 .java
 # 行为：跑 mvn compile，编译失败时输出到 stderr（不阻塞会话）
 
 set -uo pipefail
@@ -49,7 +49,7 @@ if echo "$OUTPUT" | grep -qE "BUILD FAILURE|ERROR"; then
     echo "$OUTPUT" | grep -E "ERROR|error:" | head -20 >&2
     echo "" >&2
     echo "请修复编译错误后再继续。" >&2
-    # 不 exit 非零——PostWrite hook 阻塞会打断 AI 思路
+    # 不 exit 非零——PostToolUse hook 阻塞会打断 AI 思路
     # 仅提示，由 verification-before-completion 关卡把关
 fi
 

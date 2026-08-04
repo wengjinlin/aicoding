@@ -31,6 +31,16 @@ LOG_FILE="${PROJECT_ROOT}/.harness-install.log"
 EXPECTED_CLAUDE_MAJOR=2
 EXPECTED_NODE_MAJOR=18
 
+# GitHub 网络重试参数（应对国内网络抖动，时通时不通）
+# 默认值：探测 5 次/单次 4s 超时/间隔 1s — 最坏总耗时约 25s
+# 实测在 20% 成功率的网络下，5 次尝试全失败概率约 33%（vs 3 次的 51%）
+# 如果你的网络特别差，可在脚本开头改大 GITHUB_PROBE_MAX_ATTEMPTS
+GITHUB_PROBE_MAX_ATTEMPTS=5      # 探测最大尝试次数
+GITHUB_PROBE_TIMEOUT=4           # 单次探测超时（秒）
+GITHUB_PROBE_INTERVAL=1          # 探测失败后等待间隔（秒）
+SKILLS_INSTALL_MAX_ATTEMPTS=3    # 单 skill 克隆最大尝试次数（克隆较慢，3 次足够）
+SKILLS_INSTALL_INTERVAL=3        # 克隆失败后等待间隔（秒）
+
 # 组件清单
 GLOBAL_TOOLS=("claude-code" "openspec")
 PROJECT_SKILLS=("superpowers" "gstack" "HyperSpec" "ecc")
@@ -60,6 +70,11 @@ MODE="conservative"     # conservative | force | dryrun
 VERBOSE=0
 ASSUME_YES=0
 BACKUP_DIR=""
+
+# GitHub 探测相关状态
+GITHUB_REACHABLE=0             # 0=未知/不通  1=可达
+GITHUB_SKIPPED=0               # 0=未跳过     1=用户选择跳过 skills
+GITHUB_SKIPPED_SKILLS=()       # 待人工拷贝的 skill 名称列表
 
 # 决策记录：每个组件 → 动作（INSTALL/SKIP/MERGE/BACKUP_OVERWRITE/PRESERVE）
 declare -A DECISIONS
@@ -161,10 +176,219 @@ EOF
 }
 
 # =============================================================================
+# GitHub 连通性探测：skills 通过 git clone 装，npm 镜像管不到
+# 策略：N 次探测全部通过才算"稳定可达"，直接继续；
+#       任一次失败即视为"波动"，弹菜单让用户选择（默认：忽略波动继续装）
+# =============================================================================
+check_github_connectivity() {
+    log_step "测试 GitHub 连通性（共 $GITHUB_PROBE_MAX_ATTEMPTS 次，全部通过才算稳定）"
+
+    if ! has_cmd curl; then
+        log_warn "未检测到 curl — 跳过 GitHub 连通性测试。如后续 skills 安装失败，请检查网络。"
+        GITHUB_SKIPPED=1
+        GITHUB_SKIPPED_SKILLS=("${PROJECT_SKILLS[@]}")
+        return 1
+    fi
+
+    local passed=0 failed=0
+    local attempt=0
+    local http_code="000"
+
+    while [[ $attempt -lt $GITHUB_PROBE_MAX_ATTEMPTS ]]; do
+        attempt=$((attempt + 1))
+        # curl 失败（超时/DNS 解析失败）时 -w 仍会输出 "000"
+        http_code=$(curl -sI -o /dev/null -w "%{http_code}" --max-time "$GITHUB_PROBE_TIMEOUT" https://github.com 2>/dev/null)
+        http_code="${http_code:-000}"
+
+        local is_ok=0
+        case "$http_code" in
+            200|301|302|307|308)
+                passed=$((passed + 1))
+                is_ok=1
+                log_verbose "第 $attempt/$GITHUB_PROBE_MAX_ATTEMPTS 次：✅ HTTP $http_code"
+                ;;
+            *)
+                failed=$((failed + 1))
+                log_warn "第 $attempt/$GITHUB_PROBE_MAX_ATTEMPTS 次：❌ HTTP $http_code"
+                ;;
+        esac
+
+        # 失败后等待网络恢复；成功立即继续下一次（节省时间）
+        [[ $is_ok -eq 0 && $attempt -lt $GITHUB_PROBE_MAX_ATTEMPTS ]] && sleep "$GITHUB_PROBE_INTERVAL"
+    done
+
+    # 全通才算稳定可达
+    if [[ $failed -eq 0 ]]; then
+        log_info "✅ GitHub 稳定可达（$passed/$GITHUB_PROBE_MAX_ATTEMPTS 次全通过）"
+        GITHUB_REACHABLE=1
+        return 0
+    fi
+
+    # 有波动
+    log_warn "🌐 GitHub 连通性波动：$GITHUB_PROBE_MAX_ATTEMPTS 次中通过 $passed 次，失败 $failed 次"
+    log_warn "网络不稳定，部分 skill 克隆可能失败。请选择处理方式。"
+    prompt_github_fallback "$passed" "$failed"
+    return $?
+}
+
+# GitHub 不通或波动时的交互菜单（三选一）
+# 参数：$1=passed  $2=failed  （用于显示波动程度）
+prompt_github_fallback() {
+    local passed="${1:-0}"
+    local failed="${2:-0}"
+
+    # dryrun 模式：只打印决策不交互；默认按选项 3 模拟（不跳过）
+    if [[ "$MODE" == "dryrun" ]]; then
+        echo "  [dryrun] 实际运行会弹菜单（默认选项 3：忽略波动继续安装）"
+        return 0
+    fi
+
+    # 非交互模式（--yes）：默认选项 3（推荐项）
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+        log_warn "非交互模式（--yes）：默认选择「忽略波动继续安装」"
+        log_warn "失败的 skill 将在末尾列入待拷贝清单"
+        return 0
+    fi
+
+    cat <<EOF
+
+  ┌──────────────────────────────────────────────────────────┐
+  │  GitHub 网络波动（通过 $passed 次 / 失败 $failed 次），请选择：│
+  ├──────────────────────────────────────────────────────────┤
+  │  1) 配置 HTTPS_PROXY 环境变量（当前会话有效）              │
+  │     → 输入代理地址，自动 export，重新探测（严格判定）       │
+  │  2) 跳过 skills 安装，继续装其他组件                       │
+  │     → 后期手动从其他机器拷贝 skills 目录                   │
+  │  3) 忽略波动继续安装（推荐）                               │
+  │     → 直接尝试克隆；失败的单个 skill 自动重试 3 次后入清单  │
+  └──────────────────────────────────────────────────────────┘
+EOF
+
+    local choice
+    while true; do
+        read -r -p "请选择 [1/2/3，默认 3]: " choice
+        choice="${choice:-3}"
+        case "$choice" in
+            1)
+                if prompt_proxy_and_export; then
+                    # 用新代理严格重测（必须全部通过才算稳定）
+                    log_info "使用新代理重测 GitHub（共 $GITHUB_PROBE_MAX_ATTEMPTS 次，全部通过才算稳定）..."
+                    local probe_passed=0 probe_failed=0
+                    local probe_attempt=0
+                    local probe_code="000"
+                    while [[ $probe_attempt -lt $GITHUB_PROBE_MAX_ATTEMPTS ]]; do
+                        probe_attempt=$((probe_attempt + 1))
+                        probe_code=$(curl -sI -o /dev/null -w "%{http_code}" --max-time "$GITHUB_PROBE_TIMEOUT" https://github.com 2>/dev/null)
+                        probe_code="${probe_code:-000}"
+                        case "$probe_code" in
+                            200|301|302|307|308)
+                                probe_passed=$((probe_passed + 1))
+                                log_verbose "代理后第 $probe_attempt/$GITHUB_PROBE_MAX_ATTEMPTS 次：✅ HTTP $probe_code"
+                                ;;
+                            *)
+                                probe_failed=$((probe_failed + 1))
+                                log_warn "代理后第 $probe_attempt/$GITHUB_PROBE_MAX_ATTEMPTS 次：❌ HTTP $probe_code"
+                                [[ $probe_attempt -lt $GITHUB_PROBE_MAX_ATTEMPTS ]] && sleep "$GITHUB_PROBE_INTERVAL"
+                                ;;
+                        esac
+                    done
+
+                    if [[ $probe_failed -eq 0 ]]; then
+                        log_info "✅ 代理后稳定可达（$probe_passed/$GITHUB_PROBE_MAX_ATTEMPTS 全通过），继续安装"
+                        GITHUB_REACHABLE=1
+                        return 0
+                    fi
+
+                    log_warn "代理生效后仍波动（通过 $probe_passed 次，失败 $probe_failed 次）"
+                    log_warn "返回主菜单，可选择 3 忽略波动继续"
+                    # 回到主菜单循环
+                    continue
+                fi
+                # 用户取消了代理输入，循环回主菜单
+                ;;
+            2)
+                log_info "已跳过 GitHub skills 安装。其他组件（hooks/配置/文档）继续。"
+                GITHUB_SKIPPED=1
+                GITHUB_SKIPPED_SKILLS=("${PROJECT_SKILLS[@]}")
+                return 1
+                ;;
+            3)
+                log_info "忽略波动，继续尝试安装 skills。"
+                log_info "每个 skill 自动重试 $SKILLS_INSTALL_MAX_ATTEMPTS 次；仍失败的将列入末尾的待拷贝清单。"
+                # 不设 GITHUB_SKIPPED=1，进入正常安装流程
+                return 0
+                ;;
+            *)
+                echo "请输入 1、2 或 3"
+                ;;
+        esac
+    done
+}
+
+# 让用户输入代理地址并自动 export
+prompt_proxy_and_export() {
+    while true; do
+        echo
+        echo "代理地址格式：http://host:port 或 https://host:port"
+        echo "示例："
+        echo "  http://proxy.company.com:8080"
+        echo "  http://127.0.0.1:7890       (Clash 默认)"
+        echo "  http://127.0.0.1:10809      (V2Ray 默认)"
+        echo "  http://127.0.0.1:1080       (SS/SSR 默认)"
+        read -r -p "代理地址（直接回车取消）: " proxy
+
+        if [[ -z "$proxy" ]]; then
+            log_warn "已取消代理输入，返回主菜单"
+            return 1
+        fi
+
+        # 校验：必须以 http:// 或 https:// 开头
+        if [[ ! "$proxy" =~ ^https?://[A-Za-z0-9._-]+:[0-9]+$ ]]; then
+            log_warn "格式不对，应为 http://host:port 或 https://host:port"
+            continue
+        fi
+
+        # 设置环境变量（仅当前 shell 会话有效）
+        export HTTPS_PROXY="$proxy"
+        export HTTP_PROXY="$proxy"
+        log_info "已 export HTTPS_PROXY=$proxy"
+        log_info "已 export HTTP_PROXY=$proxy"
+        log_warn "注意：仅当前 shell 会话有效，关闭终端后失效。如需永久生效请用 git config --global http.proxy"
+        return 0
+    done
+}
+
+# =============================================================================
 # 预检：扫描所有组件，记录决策
 # =============================================================================
 preflight_check() {
     log_step "预检：扫描系统状态"
+
+    # 0. 硬依赖：jq（settings.local.json 深度合并、OMC MCP 注册都依赖）
+    #    dryrun 模式只 warn（不写文件，让用户先看完整预检报告），其他模式直接 die
+    if ! has_cmd jq; then
+        local jq_install_hint="未检测到 jq — settings.local.json 深度合并、OMC MCP 注册都依赖它。
+
+安装方式：
+  Windows (Git Bash): winget install jqlang.jq --source winget
+                     或 scoop install jq
+                     或从 https://github.com/jqlang/jq/releases 下载 jq-windows-amd64.exe，
+                       重命名 jq.exe 放到 PATH 中（如 C:\\Users\\<你>\\bin\\）
+  macOS (Homebrew):   brew install jq
+  Linux (Debian):     sudo apt-get install jq
+  Linux (RHEL/Fedora): sudo dnf install jq"
+
+        if [[ "$MODE" == "dryrun" ]]; then
+            log_warn "$jq_install_hint"
+        else
+            die "$jq_install_hint"
+        fi
+    fi
+
+    # 0.5 软依赖：python（hooks 调用 .claude/hooks/*.py 需要）。脚本本身不调用，只 warn
+    if ! has_cmd python && ! has_cmd python3; then
+        log_warn "未检测到 python — Hooks (guard_write.py / ensure_change_context.py) 需要 Python 才能运行。请安装 Python 3.x 并确保在 PATH 中。"
+    fi
 
     # 1. 全局工具
     if has_cmd claude; then
@@ -270,6 +494,9 @@ preflight_check() {
     else
         DECISIONS[".hyperspec-state.yaml"]="INSTALL"
     fi
+
+    # 9. GitHub 连通性探测（skills 克隆依赖；失败只 warn，让用户决定）
+    check_github_connectivity
 }
 
 # =============================================================================
@@ -427,6 +654,50 @@ install_global_tools() {
 }
 
 # =============================================================================
+# 单 skill 克隆（封装重试逻辑，应对网络抖动）
+# 用法：install_skill_via_npx <skill_name> <github_source>
+# 返回：0=成功（含已存在的逻辑）  1=失败（已重试 SKILLS_INSTALL_MAX_ATTEMPTS 次仍失败）
+# =============================================================================
+install_skill_via_npx() {
+    local skill="$1"
+    local src="$2"
+
+    if ! has_cmd npx; then
+        log_warn "npx 不可用，请手动执行：npx skills add $src"
+        return 1
+    fi
+
+    # 慢网优化（仅当前 shell 会话有效，不污染用户 git 全局配置）
+    # - http.lowSpeedLimit=0 + http.lowSpeedTime=999999：关闭"低速持续 N 秒就断开"
+    # - http.postBuffer=524288000（500MB）：增大 POST 缓冲，降低大仓库握手被截断概率
+    # npx skills add 内部调用 git clone，会继承这些环境变量
+    export GIT_CONFIG_PARAMETERS="'http.lowSpeedLimit=0' 'http.lowSpeedTime=999999' 'http.postBuffer=524288000'"
+
+    local attempt=0
+    while [[ $attempt -lt $SKILLS_INSTALL_MAX_ATTEMPTS ]]; do
+        attempt=$((attempt + 1))
+        if [[ $attempt -eq 1 ]]; then
+            log_info "$skill：克隆中（来源 $src）..."
+        else
+            log_info "$skill：第 $attempt/$SKILLS_INSTALL_MAX_ATTEMPTS 次尝试..."
+        fi
+        if npx skills add "$src" -y; then
+            if [[ $attempt -gt 1 ]]; then
+                log_info "$skill：✅ 第 $attempt 次尝试成功"
+            fi
+            return 0
+        fi
+        if [[ $attempt -lt $SKILLS_INSTALL_MAX_ATTEMPTS ]]; then
+            log_warn "$skill 第 $attempt 次克隆失败，${SKILLS_INSTALL_INTERVAL}s 后重试..."
+            sleep "$SKILLS_INSTALL_INTERVAL"
+        fi
+    done
+
+    log_warn "$skill：连续 $SKILLS_INSTALL_MAX_ATTEMPTS 次克隆失败"
+    return 1
+}
+
+# =============================================================================
 # 执行：项目级 skills
 # =============================================================================
 install_project_skills() {
@@ -446,24 +717,41 @@ install_project_skills() {
         local src="${SKILL_SOURCES[$skill]}"
         local target=".claude/skills/${skill,,}"
 
+        # 用户选择跳过 GitHub skills：直接跳过；仅未安装的才列入待拷贝清单
+        if [[ "$GITHUB_SKIPPED" -eq 1 ]]; then
+            if [[ "$action" == "INSTALL" ]]; then
+                log_warn "$skill：跳过（用户选择跳过 GitHub skills）— 后期手动拷贝"
+                GITHUB_SKIPPED_SKILLS+=("$skill")
+            else
+                log_info "$skill：已存在，无需拷贝"
+            fi
+            continue
+        fi
+
         case "$action" in
             SKIP)
                 log_info "$skill：跳过（已存在）"
                 ;;
             INSTALL)
-                if has_cmd npx; then
-                    npx skills add "$src" -y || log_warn "$skill 安装失败，请手动执行：npx skills add $src"
+                if install_skill_via_npx "$skill" "$src"; then
+                    :
                 else
-                    log_warn "npx 不可用，请手动执行：npx skills add $src"
+                    GITHUB_SKIPPED_SKILLS+=("$skill")
                 fi
                 ;;
             BACKUP_OVERWRITE)
                 if [[ -n "$BACKUP_DIR" && -d "$target" ]]; then
-                    cp -r "$target" "$BACKUP_DIR/${target#$PROJECT_ROOT/}"
+                    local bdst="$BACKUP_DIR/${target#$PROJECT_ROOT/}"
+                    mkdir -p "$(dirname "$bdst")"
+                    cp -r "$target" "$bdst"
                 fi
                 rm -rf "$target"
-                if has_cmd npx; then
-                    npx skills add "$src" -y || log_warn "$skill 重装失败"
+                # 本地版本已删除，重装；失败则加入清单（用户需重装）
+                if install_skill_via_npx "$skill" "$src"; then
+                    :
+                else
+                    log_warn "$skill：本地已删除但重装失败，已加入待拷贝清单"
+                    GITHUB_SKIPPED_SKILLS+=("$skill")
                 fi
                 ;;
         esac
@@ -490,7 +778,11 @@ install_quick_review_skill() {
             fi
             ;;
         BACKUP_OVERWRITE)
-            [[ -n "$BACKUP_DIR" && -d "$target" ]] && cp -r "$target" "$BACKUP_DIR/${target#$PROJECT_ROOT/}"
+            if [[ -n "$BACKUP_DIR" && -d "$target" ]]; then
+                local bdst="$BACKUP_DIR/${target#$PROJECT_ROOT/}"
+                mkdir -p "$(dirname "$bdst")"
+                cp -r "$target" "$bdst"
+            fi
             rm -rf "$target"
             mkdir -p "$target"
             [[ -d "$src" ]] && cp -r "$src/." "$target/"
@@ -569,14 +861,27 @@ install_settings() {
     ]
   },
   "hooks": {
-    "PreWrite": [
-      { "type": "command", "command": "python .claude/hooks/guard_write.py" }
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "python .claude/hooks/guard_write.py" }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python .claude/hooks/ensure_change_context.py" }
+        ]
+      }
     ],
-    "PreBash": [
-      { "type": "command", "command": "python .claude/hooks/ensure_change_context.py" }
-    ],
-    "PostWrite": [
-      { "type": "command", "command": "bash .claude/hooks/run_checks.sh", "matcher": "\\.java$" }
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/run_checks.sh" }
+        ]
+      }
     ]
   },
   "mcpServers": {}
@@ -609,14 +914,27 @@ EOF
     ]
   },
   "hooks": {
-    "PreWrite": [
-      { "type": "command", "command": "python .claude/hooks/guard_write.py" }
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "python .claude/hooks/guard_write.py" }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python .claude/hooks/ensure_change_context.py" }
+        ]
+      }
     ],
-    "PreBash": [
-      { "type": "command", "command": "python .claude/hooks/ensure_change_context.py" }
-    ],
-    "PostWrite": [
-      { "type": "command", "command": "bash .claude/hooks/run_checks.sh", "matcher": "\\.java$" }
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/run_checks.sh" }
+        ]
+      }
     ]
   },
   "mcpServers": {}
@@ -624,9 +942,15 @@ EOF
 EOF
 )
                 # 用 jq 做深度合并（*.local.json + 模板）
-                jq -s '.[0] as $a | .[1] as $b | $a * $b' "$dst" <(echo "$template_json") > "$tmp" \
-                    && mv "$tmp" "$dst" \
-                    || { rm -f "$tmp"; log_warn "jq 合并失败，保留原文件未改动"; }
+                # 注意：原写法 `jq ... <(echo "$template_json")` 用了进程替换，
+                # Windows 原生 jq 不识别 MSYS 的 /proc/<pid>/fd/63 伪路径，会报错。
+                # 改成 mktemp 写入临时文件再读取，跨平台兼容。
+                local tmpl_file
+                tmpl_file=$(mktemp)
+                printf '%s' "$template_json" > "$tmpl_file"
+                jq -s '.[0] as $a | .[1] as $b | $a * $b' "$dst" "$tmpl_file" > "$tmp" \
+                    && { rm -f "$tmpl_file"; mv "$tmp" "$dst"; } \
+                    || { rm -f "$tmpl_file" "$tmp"; log_warn "jq 合并失败，保留原文件未改动"; }
                 log_info "settings.local.json：已深度合并"
             else
                 log_warn "jq 未安装，无法深度合并。原文件保留，请手动合并模板。"
@@ -776,11 +1100,101 @@ print_summary() {
     echo "  2. 验证安装：/hyperspec --help"
     echo "  3. 让 AI 补全项目文档（AGENTS.md/CLAUDE.md/REVIEW.md/openspec/config.yaml）"
     echo
+    echo "==================== 复制下面整段 prompt 粘贴到 Claude Code 执行 ===================="
+    echo
+    cat <<'PROMPT_EOF'
+请按本项目实际补全 4 个文档：AGENTS.md / CLAUDE.md / REVIEW.md / openspec/config.yaml
+
+步骤：
+1. 探测技术栈：检查根目录 pom.xml/build.gradle/package.json/go.mod 等确定语言、构建工具、ORM、测试框架；扫描 src/ 主要包结构；读 README.md（如有）
+2. 按每个文件顶部的模板注释逐个补全：
+   - AGENTS.md / CLAUDE.md / REVIEW.md：填项目名、构建命令、测试命令、关键目录、协作规则
+   - openspec/config.yaml：补全 project.*、tech_stack.*（model_routing.* 保持模板默认即可）
+3. 要求：只填 TODO 或空字段，不重写已存在内容；探测不到的字段保留空字符串或 TODO，不要瞎猜；完成后用一段话总结每个文件改了哪些字段
+4. 如关键信息探测不到（根目录无任何构建文件），先问我项目类型再继续，不要凭空猜测
+PROMPT_EOF
+    echo
+    echo "==================================== 复制结束 ===================================="
+    echo
     if [[ -n "$BACKUP_DIR" ]]; then
         echo "📦 本次备份：${BACKUP_DIR#$PROJECT_ROOT/}"
         echo "   30 天后自动清理（编辑脚本 BACKUP_RETENTION_DAYS 调整）"
         echo
     fi
+
+    # 待人工拷贝的 skills 清单（用户选跳过或安装失败导致）
+    if [[ ${#GITHUB_SKIPPED_SKILLS[@]} -gt 0 ]]; then
+        local -A src_to_skill=(
+            [superpowers]="obra/superpowers"
+            [gstack]="garrytan/gstack"
+            [HyperSpec]="wind7rui/HyperSpec"
+            [ecc]="affaan-m/ecc"
+        )
+
+        echo "⚠️  待人工处理的 skills（共 ${#GITHUB_SKIPPED_SKILLS[@]} 个）：$(IFS=,; echo "${GITHUB_SKIPPED_SKILLS[*]}")"
+        echo "────────────────────────────────────────────────────────────"
+        echo "原因：GitHub 不可达或克隆失败（多次重试后）。"
+        echo
+
+        echo "  详细信息："
+        for skill in "${GITHUB_SKIPPED_SKILLS[@]}"; do
+            local src="${src_to_skill[$skill]:-unknown}"
+            local lower="${skill,,}"
+            echo "    • $skill"
+            echo "      GitHub : https://github.com/$src"
+            echo "      目标路径: .claude/skills/$lower/"
+        done
+        echo
+
+        echo "═══════════════════════════════════════════════════════════"
+        echo "🚀 方案 A：修复网络后在本项目根一键重装（推荐）"
+        echo "═══════════════════════════════════════════════════════════"
+        echo
+        echo "  # 1. 进入项目根（当前你已经在：${PROJECT_ROOT#$PROJECT_ROOT/..\/}）"
+        echo "  cd \"${PROJECT_ROOT}\""
+        echo
+        echo "  # 2. 如需代理（公司内网）：取消下面一行注释并改地址"
+        echo "  # export HTTPS_PROXY=http://your-proxy:port"
+        echo "  # export HTTP_PROXY=http://your-proxy:port"
+        echo
+        echo "  # 3. 慢网优化（应对抖动网络）"
+        echo "  export GIT_CONFIG_PARAMETERS=\"'http.lowSpeedLimit=0' 'http.lowSpeedTime=999999' 'http.postBuffer=524288000'\""
+        echo
+        echo "  # 4. 逐个安装失败的 skills"
+        for skill in "${GITHUB_SKIPPED_SKILLS[@]}"; do
+            local src="${src_to_skill[$skill]:-unknown}"
+            echo "  npx skills add $src -y"
+        done
+        echo
+        echo "  # 5. 验证（每个应输出 OK）"
+        for skill in "${GITHUB_SKIPPED_SKILLS[@]}"; do
+            local lower="${skill,,}"
+            echo "  ls .claude/skills/$lower/SKILL.md >/dev/null 2>&1 && echo \"$skill OK\" || echo \"$skill MISSING\""
+        done
+        echo
+        echo "═══════════════════════════════════════════════════════════"
+        echo "📦 方案 B：从已装好的机器拷贝（公司禁 GitHub 时用）"
+        echo "═══════════════════════════════════════════════════════════"
+        echo
+        echo "  # 在源机器（已装好 harness-infra 的项目）执行："
+        echo "  cd <源项目根>"
+        local tar_targets=""
+        for skill in "${GITHUB_SKIPPED_SKILLS[@]}"; do
+            local lower="${skill,,}"
+            tar_targets="$tar_targets $lower"
+        done
+        echo "  tar czf skills.tar.gz -C .claude/skills$tar_targets"
+        echo
+        echo "  # 拷贝 skills.tar.gz 到本项目根后解压："
+        echo "  cd \"${PROJECT_ROOT}\""
+        echo "  tar xzf skills.tar.gz -C .claude/skills/"
+        echo "  rm skills.tar.gz"
+        echo
+        echo "  # 重启 Claude Code 会话验证：claude → /<skill-name> --help"
+        echo "────────────────────────────────────────────────────────────"
+        echo
+    fi
+
     if [[ "$MODE" == "dryrun" ]]; then
         echo "🧪 这是 dry-run，未实际写文件。去掉 --dry-run 重新执行以真正安装。"
     fi

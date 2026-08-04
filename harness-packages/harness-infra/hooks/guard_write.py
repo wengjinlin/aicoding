@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# guard_write.py — PreWrite Hook
+# guard_write.py — PreToolUse Hook (matcher: Write|Edit|NotebookEdit)
 # 拦截对保护目录/文件的写入，防止 AI 误改配置文件、SQL 脚本、生产数据
 #
-# 触发：每次 Edit / Write 工具调用前
+# 触发：每次 Edit / Write / NotebookEdit 工具调用前
 # 返回：非零退出码则阻止写入
 
 import json
